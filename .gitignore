@@ -2,3 +2,5 @@ data/
 모두딥2/MNIST_data
 모두딥2/cifar10
 MNIST_data/
+glove6B/
+CIFAR100_data/
