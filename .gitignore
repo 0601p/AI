@@ -4,3 +4,4 @@ data/
 MNIST_data/
 glove6B/
 CIFAR100_data/
+Transformer/model.pth
