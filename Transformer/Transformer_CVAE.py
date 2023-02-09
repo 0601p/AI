@@ -14,13 +14,15 @@ from torch.nn import TransformerDecoderLayer
 from torch.nn import TransformerEncoder
 from torch.nn import TransformerDecoder
 from torch.nn import Embedding
+from torch.nn import CrossEntropyLoss
+
 
 # This model is from torch github https://github.com/pytorch/pytorch/blob/master/torch/nn/modules/transformer.py
 # I just edited some parts to use it as transformer_VAE
 # Transformer VAE paper : https://ieeexplore.ieee.org/document/9054554
 # notion : https://www.notion.so/binne/YAI-X-POZAlabs-852ef538af984d99abee33037751547c
 
-class Transformer_VAE(Module):
+class Transformer_CVAE(Module):
     """
     Args:
         d_model: the number of expected features in the encoder/decoder inputs (default=512).
@@ -41,7 +43,7 @@ class Transformer_VAE(Module):
     """
 
     def __init__(self, d_model: int = 512, nhead: int = 8, num_encoder_layers: int = 6,
-                 num_decoder_layers: int = 6, dim_feedforward: int = 2048, vocab_size: int = 729, seq_len: int = 256, dropout: float = 0.1,
+                 num_decoder_layers: int = 6, dim_feedforward: int = 2048, pad_idx: int = 0, vocab_size: int = 729, seq_len: int = 256, cdt_len: int = 11, dropout: float = 0.1,
                  activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
                  custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
@@ -77,14 +79,17 @@ class Transformer_VAE(Module):
         self.nhead = nhead
         self.batch_first = batch_first
         self.device = device
+        self.cdt_len = cdt_len
 
+        self.local_encoder = Linear(d_model, d_model, **factory_kwargs)
+        self.local_decoder = Linear(d_model, vocab_size, **factory_kwargs)
         self.condition_embed = TokenEmbedding(d_model, vocab_size=vocab_size, **factory_kwargs)
         self.src_tgt_embed = TransformerEmbedding(d_model, vocab_size, seq_len, batch_first=batch_first, **factory_kwargs)
-        self.criterion = criterion
+        self.criterion = VAE_Loss(beta=1, pad_idx=0) # beta = 1 from Transformer VAE paper, pad_idx from ComMU dataset
 
     def forward_(self, src: Tensor, tgt: Tensor, cdt: Tensor, src_mask: Optional[Tensor] = None, tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None, src_key_padding_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+                tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
         """Take in and process masked source/target sequences.
 
         Args:
@@ -142,16 +147,16 @@ class Transformer_VAE(Module):
             raise RuntimeError("the feature number of src and tgt must be equal to d_model")
 
         encoder_out = self.encoder(src, mask=src_mask, src_key_padding_mask=src_key_padding_mask)
-        latent_sample = self.sample_layer(encoder_out)
+        latent_sample, latent_mu, latent_std = self.sample_layer(encoder_out)
         if self.batch_first:
             seq_pos = 1
         else:
             seq_pos = 0
-        latent_condition = torch.concat(latent_sample, cdt, dim = seq_pos)
-        output = self.decoder(tgt, latent_condition , tgt_mask=tgt_mask, memory_mask=memory_mask,
+        latent_condition = torch.concat((latent_sample, cdt), dim = seq_pos)
+        output = self.decoder(tgt, latent_condition, tgt_mask=tgt_mask, memory_mask=memory_mask,
                               tgt_key_padding_mask=tgt_key_padding_mask,
                               memory_key_padding_mask=memory_key_padding_mask)
-        return output
+        return (output, latent_mu, latent_std)
     
     # src : word sequence
     # tgt : word sequence that starts with start token
@@ -161,12 +166,17 @@ class Transformer_VAE(Module):
                 tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         
         src_tgt_mask = self.generate_square_subsequent_mask(self.seq_len, device=self.device)
+        cross_attention_mask = self.generate_rectangle_subsequent_mask(self.seq_len + self.cdt_len, self.seq_len, device=self.device)
         
         src_embed = self.src_tgt_embed(src)
         tgt_embed = self.src_tgt_embed(tgt)
         cdt_embed = self.condition_embed(cdt)
-        out = self.forward_(src_embed, tgt_embed, cdt_embed, src_tgt_mask, src_tgt_mask, memory_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask)
-        loss = self.criterion(out, tgt)
+
+        src_embed = self.local_encoder(src_embed)
+        tgt_embed = self.local_encoder(tgt_embed)
+        out, latent_mu, latent_std = self.forward_(src_embed, tgt_embed, cdt_embed, src_tgt_mask, src_tgt_mask, memory_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask)
+        pred = F.log_softmax(self.local_decoder(out), dim = 2)
+        loss = self.criterion(pred, src, latent_mu, latent_std)
         return (loss, out)
 
 
@@ -176,6 +186,10 @@ class Transformer_VAE(Module):
             Unmasked positions are filled with float(0.0).
         """
         return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
+    
+    @staticmethod
+    def generate_rectangle_subsequent_mask(xsz: int, ysz: int, device='cpu') -> Tensor:
+        return torch.triu(torch.full((xsz, ysz), float('-inf'), device=device), diagonal=1)
 
     def _reset_parameters(self):
         r"""Initiate parameters in the transformer model."""
@@ -201,7 +215,7 @@ class VAEsample(Module):
         latent_mean = lin_out[:, :, :self.d_model]
         latent_std = torch.exp(lin_out[:, :, self.d_model:] / 2)
         norm_sample = torch.normal(mean = 0, std = 1, size=latent_mean.size(), device=self.device)
-        return latent_mean + latent_std * norm_sample
+        return latent_mean + latent_std * norm_sample, latent_mean, latent_std
 
 
 class TokenEmbedding(Module):
@@ -252,10 +266,24 @@ class TransformerEmbedding(Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(TransformerEmbedding, self).__init__()
         self.embed = TokenEmbedding(d_model=d_model, vocab_size=vocab_size, **factory_kwargs)
-        self.positional = PositionalEncoding(d_model=d_model, max_len=max_len, batch_first=batch_first **factory_kwargs)
+        self.positional = PositionalEncoding(d_model=d_model, max_len=max_len, batch_first=batch_first, **factory_kwargs)
     
     # input size : 
     # (batch_size, seq_length) if batch_first is True
     # (seq_length, batch_size) if batch_first is False
     def forward(self, x) -> Tensor:
         return self.positional(self.embed(x))
+
+class VAE_Loss(Module):
+    def __init__(self, beta: int, pad_idx: int) -> None:
+        super(VAE_Loss, self).__init__()
+        self.beta = beta
+        self.reconstruction_loss = CrossEntropyLoss(ignore_index=pad_idx)
+    
+    def forward(self, pred: Tensor, output: Tensor, latent_mu: Tensor, latent_std: Tensor) -> Tensor:
+        kld_loss = - 0.5 * torch.sum(1 + 2 * torch.log(torch.abs(latent_mu)) - latent_mu.pow(2) - latent_std.pow(2))
+        sz = output.size(0) * output.size(1)
+        rec_loss = self.reconstruction_loss(pred.contiguous().view(sz, -1), output.contiguous().view(sz))
+
+        return kld_loss / sz * self.beta + rec_loss
+
