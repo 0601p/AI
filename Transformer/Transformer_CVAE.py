@@ -42,14 +42,14 @@ class Transformer_CVAE(Module):
             other attention and feedforward operations, otherwise after. Default: ``False`` (after).
     """
 
-    def __init__(self, d_model: int = 512, nhead: int = 8, num_encoder_layers: int = 6,
+    def __init__(self, d_model: int = 512, d_latent: int = 64, nhead: int = 8, num_encoder_layers: int = 6,
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, pad_idx: int = 0, vocab_size: int = 729, seq_len: int = 256, cdt_len: int = 11, dropout: float = 0.1,
                  activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
                  custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
                  device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
-        super(Transformer_VAE, self).__init__()
+        super(Transformer_CVAE, self).__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
 
         if custom_encoder is not None:
@@ -61,7 +61,7 @@ class Transformer_CVAE(Module):
             encoder_norm = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
             self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
-        self.sample_layer = VAEsample(d_model, **factory_kwargs)
+        self.sample_layer = VAEsample(d_model, d_latent, batch_first, **factory_kwargs)
 
         if custom_decoder is not None:
             self.decoder = custom_decoder
@@ -75,6 +75,7 @@ class Transformer_CVAE(Module):
         self._reset_parameters()
 
         self.d_model = d_model
+        self.d_latent = d_latent
         self.seq_len = seq_len
         self.nhead = nhead
         self.batch_first = batch_first
@@ -83,7 +84,7 @@ class Transformer_CVAE(Module):
 
         self.local_encoder = Linear(d_model, d_model, **factory_kwargs)
         self.local_decoder = Linear(d_model, vocab_size, **factory_kwargs)
-        self.condition_embed = TokenEmbedding(d_model, vocab_size=vocab_size, **factory_kwargs)
+        self.condition_embed = TokenEmbedding(d_latent, vocab_size=vocab_size, **factory_kwargs)
         self.src_tgt_embed = TransformerEmbedding(d_model, vocab_size, seq_len, batch_first=batch_first, **factory_kwargs)
         self.criterion = VAE_Loss(beta=1, pad_idx=0) # beta = 1 from Transformer VAE paper, pad_idx from ComMU dataset
 
@@ -147,13 +148,8 @@ class Transformer_CVAE(Module):
             raise RuntimeError("the feature number of src and tgt must be equal to d_model")
 
         encoder_out = self.encoder(src, mask=src_mask, src_key_padding_mask=src_key_padding_mask)
-        latent_sample, latent_mu, latent_std = self.sample_layer(encoder_out)
-        if self.batch_first:
-            seq_pos = 1
-        else:
-            seq_pos = 0
-        latent_condition = torch.concat((latent_sample, cdt), dim = seq_pos)
-        output = self.decoder(tgt, latent_condition, tgt_mask=tgt_mask, memory_mask=memory_mask,
+        latent_sample, latent_mu, latent_std = self.sample_layer(encoder_out, cdt)
+        output = self.decoder(tgt, latent_sample, tgt_mask=tgt_mask, memory_mask=memory_mask,
                               tgt_key_padding_mask=tgt_key_padding_mask,
                               memory_key_padding_mask=memory_key_padding_mask)
         return (output, latent_mu, latent_std)
@@ -200,22 +196,31 @@ class Transformer_CVAE(Module):
 
 
 class VAEsample(Module):
-    def __init__(self, d_model, device=None, dtype=None) -> None:
+    def __init__(self, d_model: int, d_latent: int, batch_first: bool, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(VAEsample, self).__init__()
         self.device = device
+        self.d_latent = d_latent
         self.d_model = d_model
-        self.sample_linear = Linear(d_model, d_model * 2, **factory_kwargs)
+        if batch_first:
+            self.seq_pos = 1
+        else:
+            self.seq_pos = 0
+        self.model2sample = Linear(d_model, d_latent * 2, **factory_kwargs)
+        self.latent2model = Linear(d_latent, d_model, **factory_kwargs)
     
     # input size : 
     # (batch_size, seq_length, d_model) if batch_first is True
     # (seq_length, batch_size, d_model) if batch_first is False
-    def forward(self, x):
-        lin_out = self.sample_linear(x)
-        latent_mean = lin_out[:, :, :self.d_model]
-        latent_std = torch.exp(lin_out[:, :, self.d_model:] / 2)
+    def forward(self, x, cdt):
+        lin_out = self.model2sample(x)
+        latent_mean = lin_out[:, :, :self.d_latent]
+        latent_std = torch.exp(lin_out[:, :, self.d_latent:] / 2)
         norm_sample = torch.normal(mean = 0, std = 1, size=latent_mean.size(), device=self.device)
-        return latent_mean + latent_std * norm_sample, latent_mean, latent_std
+        out = latent_mean + latent_std * norm_sample
+        out = torch.concat((out, cdt), dim = self.seq_pos)
+        out = self.latent2model(out)
+        return out, latent_mean, latent_std
 
 
 class TokenEmbedding(Module):
